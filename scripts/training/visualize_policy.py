@@ -60,7 +60,7 @@ def _try_render(model, height: int, width: int):
 
 
 def rollout(
-    cfg, policy: GaussianPolicy, env: LegoDogEnv, n_steps: int,
+    policy: GaussianPolicy, env: LegoDogEnv, n_steps: int,
     deterministic: bool, baseline_only: bool, device: str,
 ):
     obs = env.reset()
@@ -104,13 +104,40 @@ def rollout(
     return rows, cum_reward
 
 
+def _write_mp4(frames, out_path: Path, fps: float):
+    """Encode frames as MP4, with explicit FFMPEG plugin selection.
+
+    Without the explicit `format="FFMPEG"`, imageio's auto-detection silently
+    falls back to TIFF when `imageio-ffmpeg` isn't installed — which then
+    rejects the `fps` / `codec` kwargs with a confusing TypeError. Forcing
+    FFMPEG raises a clear ImportError instead.
+    """
+    import imageio.v2 as iio
+    try:
+        iio.mimsave(str(out_path), frames, format="FFMPEG",
+                    fps=fps, codec="libx264", quality=8)
+        return out_path
+    except (ImportError, ValueError, Exception) as e:
+        # Plugin not available — write PNG frames instead so the user still
+        # has visual evidence.
+        png_dir = out_path.with_suffix("")
+        png_dir.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(frames):
+            iio.imwrite(str(png_dir / f"frame_{i:05d}.png"), frame)
+        raise RuntimeError(
+            f"MP4 encoding failed ({e}). Wrote {len(frames)} PNG frames to "
+            f"{png_dir}/ instead. To enable MP4 output run:\n"
+            f"    pip install imageio-ffmpeg\n"
+            f"You can stitch the PNGs into an MP4 manually with:\n"
+            f"    ffmpeg -framerate {fps} -i {png_dir}/frame_%05d.png -c:v libx264 -pix_fmt yuv420p {out_path}"
+        ) from e
+
+
 def render_video(env: LegoDogEnv, policy: GaussianPolicy, rows, out_path: Path,
                  width: int, height: int, fps: float, deterministic: bool,
                  baseline_only: bool, device: str,
                  distance: float, azimuth: float, elevation: float):
     """Second pass that re-rolls the (deterministic) policy and captures frames."""
-    import imageio.v2 as iio
-
     renderer = _try_render(env.model, height=height, width=width)
     cam = mujoco.MjvCamera()
     cam.fixedcamid = -1
@@ -140,7 +167,7 @@ def render_video(env: LegoDogEnv, policy: GaussianPolicy, rows, out_path: Path,
         renderer.update_scene(env.data, camera=cam)
         frames.append(renderer.render())
 
-    iio.mimsave(str(out_path), frames, fps=fps, codec="libx264", quality=8)
+    _write_mp4(frames, out_path, fps)
     return out_path, len(frames)
 
 
@@ -246,7 +273,7 @@ def main():
 
     # First pass: collect logs without rendering (cheap).
     rows, cum_reward = rollout(
-        cfg=cfg, policy=policy, env=env,
+        policy=policy, env=env,
         n_steps=args.n_steps, deterministic=args.deterministic,
         baseline_only=args.baseline_only, device=device,
     )
