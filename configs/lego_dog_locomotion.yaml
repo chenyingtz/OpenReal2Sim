@@ -1,0 +1,86 @@
+# Step 7 — Residual RL configuration for the LEGO quadruped.
+#
+# Consumed by:
+#   scripts/exports/export_to_isaac.py   (asset packaging + scene file)
+#   scripts/training/train_residual_ppo.py (env + PPO + checkpointing)
+#
+# The action a_t sent to the joints is
+#       a_t = a_t^base + pi_theta(o_t)
+# where a_t^base is the open-loop trot below and pi_theta outputs an
+# additive joint-position correction Delta a_t bounded by residual_scale.
+
+scene:
+  urdf: assets/refined/lego_dog.urdf
+  terrain_mesh: assets/refined/terrain.obj       # optional; auto-disabled if absent
+  trajectory: data/lego_dog_walk/torso_trajectory.json
+  ground_friction: 0.9
+  gravity: [0.0, 0.0, -9.81]
+  dt: 0.005            # 200 Hz physics
+  control_dt: 0.02     # 50 Hz control (4 physics steps per action)
+
+robot:
+  base_link: base_link
+  # In leg order matching the URDF emitted by scripts/physics/generate_urdf.py
+  joint_names: [FL_hip, FL_knee, FR_hip, FR_knee, RL_hip, RL_knee, RR_hip, RR_knee]
+  spawn_height_offset: 0.005   # extra clearance above z = 0 at reset
+  pd:
+    kp: 0.2            # tuned for LEGO-scale links (~20 g, I ~ 3e-7 kg m^2)
+    kd: 0.01
+    torque_clamp: 0.5  # |tau|_inf per joint (N m)
+  joint_armature: 0.001  # effective rotor inertia added to every hinge joint
+  joint_limit_safety_margin: 0.1   # rad
+
+baseline_gait:
+  # Open-loop diagonal trot. Pair (FL, RR) and (FR, RL) are 180° out of phase.
+  cycle_seconds: 0.6
+  hip_amplitude_rad: 0.35
+  knee_amplitude_rad: 0.50
+  hip_offset_rad: 0.00
+  knee_offset_rad: -0.60          # base knee angle (slightly tucked)
+  phase_offsets:
+    FL: 0.0
+    RR: 0.0
+    FR: 0.5
+    RL: 0.5
+
+policy:
+  hidden_sizes: [128, 128]
+  activation: tanh
+  residual_scale: 0.20            # |Delta a_t|_inf <= residual_scale (rad)
+  log_std_init: -1.0              # exp(-1) ~ 0.37 rad initial exploration
+
+reward:
+  # R = exp(-||p_cc - p_o||^2 / sigma_p^2) + exp(-Dist(q_cc, q_o)^2 / sigma_q^2)
+  #     - lambda_torque * ||tau||^2 - lambda_orient * tilt^2 + alive_bonus
+  position_sigma: 0.08
+  rotation_sigma: 0.40
+  torque_penalty: 1.0e-3
+  orientation_penalty: 0.1
+  alive_bonus: 0.5
+
+training:
+  total_timesteps: 1000000
+  num_envs: 8
+  rollout_length: 256
+  num_epochs: 10
+  minibatch_size: 256
+  learning_rate: 3.0e-4
+  gae_lambda: 0.95
+  discount: 0.99
+  clip_range: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 1.0
+  seed: 0
+  device: auto
+
+episode:
+  max_steps: 500
+  early_termination:
+    base_z_min: 0.015     # robot fell over / clipped through floor
+    base_tilt_max_rad: 1.2
+
+output:
+  log_dir: runs/lego_dog_residual/
+  checkpoint_every: 100000
+  save_video_every: null    # disable video logging by default
