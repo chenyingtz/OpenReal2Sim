@@ -10,8 +10,8 @@
 # additive joint-position correction Delta a_t bounded by residual_scale.
 
 scene:
-  urdf: assets/refined/lego_dog.urdf
-  terrain_mesh: assets/refined/terrain.obj       # optional; auto-disabled if absent
+  urdf: data/lego_dog_walk/refined/lego_dog.urdf
+  terrain_mesh: data/lego_dog_walk/refined/terrain.obj       # optional; auto-disabled if absent
   trajectory: data/lego_dog_walk/torso_trajectory.json
   ground_friction: 0.9
   gravity: [0.0, 0.0, -9.81]
