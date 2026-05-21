@@ -41,7 +41,16 @@ class TerrainSDF:
         # Cast from well above the terrain to guarantee a hit.
         self._z_cast = float(mesh.bounds[1, 2]) + 1.0
 
-    def signed_distance(self, points: np.ndarray) -> np.ndarray:
+    def signed_distance(self, points: np.ndarray):
+        """Return (signed_distance, hit_mask).
+
+        For points whose XY falls inside the terrain's footprint the ray
+        hits the surface and the signed distance is `z - z_terrain`.
+        Missed rays get sd = +1.0 (a large positive constant) so they
+        contribute no penetration and no gradient — they're effectively
+        ignored. The caller should consult `hit_mask` to decide whether
+        the terrain crop is too small.
+        """
         points = np.asarray(points, dtype=np.float64)
         origins = np.column_stack([points[:, 0], points[:, 1],
                                    np.full(len(points), self._z_cast)])
@@ -49,11 +58,12 @@ class TerrainSDF:
         locations, ray_idx, _ = self._ri.intersects_location(
             ray_origins=origins, ray_directions=directions, multiple_hits=False
         )
-        # Default: missed rays sit infinitely above (no penetration risk).
-        z_terrain = np.full(len(points), -np.inf)
+        hit_mask = np.zeros(len(points), dtype=bool)
+        sd = np.ones(len(points), dtype=np.float64)  # missed → +1.0 m
         if len(ray_idx):
-            z_terrain[ray_idx] = locations[:, 2]
-        return points[:, 2] - z_terrain
+            hit_mask[ray_idx] = True
+            sd[ray_idx] = points[ray_idx, 2] - locations[:, 2]
+        return sd, hit_mask
 
 
 def _foot_samples(robot: trimesh.Trimesh, n_sample: int, foot_band: float) -> np.ndarray:
@@ -92,43 +102,73 @@ def optimize_z_offset(
     minimum signed distance is exactly `clearance`.
     """
     feet = _foot_samples(robot, n_sample, foot_band)
+    initial_sd, initial_hits = sdf.signed_distance(feet)
+    coverage = float(initial_hits.mean())
+    if coverage < 0.5:
+        print(f"[contacts] WARNING: only {coverage*100:.1f}% of foot samples "
+              f"sit above the terrain mesh — terrain crop is likely smaller "
+              f"than the robot's XY footprint. Optimization will use only "
+              f"covered samples; results may be incorrect.")
+    if coverage == 0.0:
+        raise RuntimeError(
+            "No foot samples hit the terrain mesh. The robot and terrain "
+            "footprints do not overlap in XY — re-run Step 4 producing a "
+            "terrain mesh that covers under the robot, or pass --skip_gravity "
+            "if the meshes are not in the same frame."
+        )
+
     tz = 0.0
     eps = 1e-3
     history = []
 
     for it in range(n_iter):
         pts = feet + np.array([0.0, 0.0, tz])
-        sdf_vals = sdf.signed_distance(pts)
-        penetration = np.clip(-sdf_vals, 0.0, None)
-        loss = float((penetration ** 2).mean())
+        sdf_vals, hits = sdf.signed_distance(pts)
+        if not hits.any():
+            break
+        pen_full = np.clip(-sdf_vals, 0.0, None)
+        loss = float((pen_full[hits] ** 2).mean())
         history.append(loss)
         if loss < 1e-10:
             break
         pts_up = pts + np.array([0.0, 0.0, eps])
-        sdf_up = sdf.signed_distance(pts_up)
+        sdf_up, _ = sdf.signed_distance(pts_up)
         d_pen = -(sdf_up - sdf_vals) / eps  # d(penetration)/dz, with sign mask
-        grad = float((2.0 * penetration * d_pen * (penetration > 0)).mean())
-        step = np.clip(-lr * grad, -max_step, max_step)
+        grad_full = 2.0 * pen_full * d_pen * (pen_full > 0)
+        grad = float(grad_full[hits].mean())
+        step = float(np.clip(-lr * grad, -max_step, max_step))
+        if not np.isfinite(step):
+            break
         tz += step
 
-    # Final clearance bump: lift so deepest foot is `clearance` above the surface.
+    # Final clearance bump: lift so deepest covered foot is `clearance` above.
     pts = feet + np.array([0.0, 0.0, tz])
-    min_dist = float(sdf.signed_distance(pts).min())
-    if min_dist < clearance:
-        tz += (clearance - min_dist)
+    sd_final, hits_final = sdf.signed_distance(pts)
+    if hits_final.any():
+        min_dist = float(sd_final[hits_final].min())
+        if min_dist < clearance:
+            tz += (clearance - min_dist)
+
+    if not np.isfinite(tz):
+        raise RuntimeError(
+            f"Contact optimizer produced non-finite delta_z (={tz}). "
+            "Check that the robot and terrain meshes are in the same metric "
+            "frame and that the terrain covers the robot's XY footprint."
+        )
 
     refined = robot.copy()
     T = np.eye(4)
     T[2, 3] = tz
     refined.apply_transform(T)
 
+    sd_done, hits_done = sdf.signed_distance(feet + np.array([0.0, 0.0, tz]))
+    final_min = float(sd_done[hits_done].min()) if hits_done.any() else float("nan")
     info = {
         "delta_z": float(tz),
-        "final_min_signed_distance": float(
-            sdf.signed_distance(feet + np.array([0.0, 0.0, tz])).min()
-        ),
+        "final_min_signed_distance": final_min,
+        "foot_terrain_coverage": coverage,
         "iterations": len(history),
-        "loss_history": history[::max(1, len(history) // 32)],
+        "loss_history": history[::max(1, len(history) // 32)] if history else [],
     }
     return refined, info
 
