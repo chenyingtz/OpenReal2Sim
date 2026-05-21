@@ -161,11 +161,24 @@ def quat_xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
 # ───────────────────────── MuJoCo environment ─────────────────────────
 
 class LegoDogEnv:
-    """Single-instance MuJoCo env. Action = residual Delta a (size n_joints)."""
+    """Single-instance MuJoCo env.
 
-    def __init__(self, cfg: TrainCfg, seed: int = 0):
+    Two action modes are supported, used by the three training scripts:
+      - "residual"  (default, train_residual_ppo.py): action is the additive
+                    correction Delta a on top of the open-loop trot baseline.
+                    Output bounded to +-residual_scale (~0.2 rad).
+      - "direct"    (train_direct_ppo.py and train_bc.py cloning a direct
+                    expert): action is a normalized joint command in [-1, +1]
+                    that the env maps onto the per-joint range [q_lo, q_hi].
+                    No trot baseline is added.
+    """
+
+    def __init__(self, cfg: TrainCfg, seed: int = 0, action_mode: str = "residual"):
         self.cfg = cfg
         self.rng = np.random.default_rng(seed)
+        if action_mode not in ("residual", "direct"):
+            raise ValueError(f"Unknown action_mode: {action_mode}")
+        self.action_mode = action_mode
 
         # URDF is the source of truth; MuJoCo's MJCF parser does not accept
         # URDF directly (its <include> requires MJCF), so we load via MjSpec
@@ -218,6 +231,18 @@ class LegoDogEnv:
         # Action dims / bounds
         self.residual_scale = float(cfg.policy["residual_scale"])
         self.act_dim = self.n_joints
+        if self.action_mode == "residual":
+            # Policy output goes through tanh*residual_scale (e.g. +-0.2 rad)
+            self.policy_act_scale = self.residual_scale
+            self._direct_center = None
+            self._direct_half_range = None
+        else:  # direct
+            # Policy output is in [-1, +1] (tanh-squashed); the env maps each
+            # joint independently to its [q_lo, q_hi] range so the policy can
+            # reach the full joint travel.
+            self.policy_act_scale = 1.0
+            self._direct_center = 0.5 * (self.q_lo + self.q_hi)
+            self._direct_half_range = 0.5 * (self.q_hi - self.q_lo)
 
         # Cache observation dim — n_joints * 2 (q, qd) + 13 base (3 pos, 4 quat,
         # 3 linvel, 3 angvel) + 2 phase (sin, cos) + 7 next-frame target (3
@@ -325,11 +350,17 @@ class LegoDogEnv:
         self.cum_reward = 0.0
         return self._get_obs()
 
-    def step(self, residual: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
-        residual = np.clip(np.asarray(residual, dtype=np.float64),
-                           -self.residual_scale, self.residual_scale)
-        baseline = self.trot(self.t_sim)
-        target = np.clip(baseline + residual, self.q_lo, self.q_hi)
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
+        action = np.clip(np.asarray(action, dtype=np.float64),
+                         -self.policy_act_scale, self.policy_act_scale)
+        if self.action_mode == "residual":
+            baseline = self.trot(self.t_sim)
+            target = np.clip(baseline + action, self.q_lo, self.q_hi)
+        else:  # direct
+            target = np.clip(
+                self._direct_center + self._direct_half_range * action,
+                self.q_lo, self.q_hi,
+            )
 
         # PD control over the joints (no actuators required — write torques).
         # Clamp each joint torque to a per-joint limit so a single noisy
@@ -504,7 +535,7 @@ class PPOTrainer:
             hidden=cfg.policy["hidden_sizes"],
             activation=cfg.policy["activation"],
             log_std_init=cfg.policy["log_std_init"],
-            residual_scale=env.residual_scale,
+            residual_scale=env.policy_act_scale,
         ).to(self.device)
         self.value = ValueNet(
             obs_dim=env.obs_dim,
@@ -677,6 +708,9 @@ class PPOTrainer:
             "obs_dim": self.env.obs_dim,
             "act_dim": self.env.act_dim,
             "residual_scale": self.env.residual_scale,
+            "policy_act_scale": self.env.policy_act_scale,
+            "action_mode": self.env.action_mode,
+            "method": "ppo_" + self.env.action_mode,
         }, path)
         print(f"[ppo] checkpoint -> {path}")
 

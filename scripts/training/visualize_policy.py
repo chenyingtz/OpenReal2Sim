@@ -249,15 +249,11 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else (log_dir / "visualization")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    env = LegoDogEnv(cfg, seed=int(cfg.training["seed"]))
-    policy = GaussianPolicy(
-        obs_dim=env.obs_dim,
-        act_dim=env.act_dim,
-        hidden=cfg.policy["hidden_sizes"],
-        activation=cfg.policy["activation"],
-        log_std_init=cfg.policy["log_std_init"],
-        residual_scale=env.residual_scale,
-    ).to(device)
+    # Read the action_mode from the checkpoint so residual / direct PPO / BC
+    # checkpoints all visualize correctly with the env that matches their
+    # training-time interpretation of the action vector.
+    action_mode = "residual"
+    ckpt = None
     if not args.baseline_only:
         if not ckpt_path.exists():
             raise FileNotFoundError(
@@ -265,9 +261,22 @@ def main():
                 f"or pass --baseline_only to view the trot baseline."
             )
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        action_mode = ckpt.get("action_mode", "residual")
+
+    env = LegoDogEnv(cfg, seed=int(cfg.training["seed"]), action_mode=action_mode)
+    policy = GaussianPolicy(
+        obs_dim=env.obs_dim,
+        act_dim=env.act_dim,
+        hidden=cfg.policy["hidden_sizes"],
+        activation=cfg.policy["activation"],
+        log_std_init=cfg.policy["log_std_init"],
+        residual_scale=env.policy_act_scale,
+    ).to(device)
+    if ckpt is not None:
         policy.load_state_dict(ckpt["policy"])
         policy.eval()
-        print(f"[viz] loaded checkpoint {ckpt_path}")
+        method = ckpt.get("method", "ppo_residual")
+        print(f"[viz] loaded {method} checkpoint {ckpt_path} (action_mode={action_mode})")
     else:
         print(f"[viz] baseline-only rollout (no policy loaded)")
 
