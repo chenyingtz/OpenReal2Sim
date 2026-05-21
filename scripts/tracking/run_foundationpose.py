@@ -28,6 +28,7 @@ import numpy as np
 import trimesh
 
 from pose_tracker import (
+    MeshKDTree,
     _initial_pose_search,
     _load_point_cloud,
     discover_frames,
@@ -57,6 +58,7 @@ def extract_trajectory(
     output_path: str | Path,
     fps: float = 30.0,
     init_yaw_samples: int = 8,
+    mesh_samples: int = 8000,
 ) -> dict:
     mesh_path = Path(mesh_path)
     point_cloud_dir = Path(point_cloud_dir)
@@ -68,6 +70,9 @@ def extract_trajectory(
     print(f"[track] mesh   : {mesh_path}  ({len(mesh.vertices)} verts)")
     print(f"[track] frames : {len(frame_paths)} in {point_cloud_dir}")
 
+    kd = MeshKDTree(mesh, n_samples=mesh_samples)
+    print(f"[track] kd-tree: {len(kd.points)} surface samples")
+
     trajectory = []
     se3_stack = np.zeros((len(frame_paths), 4, 4), dtype=np.float64)
     R_prev = t_prev = q_prev = None
@@ -75,11 +80,13 @@ def extract_trajectory(
     for i, p in enumerate(frame_paths):
         points = _load_point_cloud(p)
         if i == 0:
-            R, t, residual = _initial_pose_search(mesh, points,
-                                                  n_yaw_samples=init_yaw_samples)
+            R, t, residual = _initial_pose_search(
+                mesh, points, n_yaw_samples=init_yaw_samples, mesh_kdtree=kd
+            )
         else:
-            R, t, residual = point_to_mesh_icp(mesh, points,
-                                               R0=R_prev, t0=t_prev)
+            R, t, residual = point_to_mesh_icp(
+                mesh, points, R0=R_prev, t0=t_prev, mesh_kdtree=kd
+            )
         q = quat_xyzw_from_R(R)
         if q_prev is not None:
             q = enforce_quat_continuity(q_prev, q)
@@ -140,6 +147,10 @@ def main():
                     help="Source video frame rate; only used for the 'time' field")
     ap.add_argument("--init_yaw_samples", type=int, default=8,
                     help="Number of yaw seeds for the frame-0 multi-start ICP")
+    ap.add_argument("--mesh_samples", type=int, default=8000,
+                    help="Surface samples used to build the kd-tree the ICP "
+                         "matches against. Increase for higher precision on "
+                         "large meshes; decrease to lower RAM.")
     ap.add_argument("--no_foundationpose", action="store_true",
                     help="Reserved for symmetry; the ICP backend is the only "
                          "supported backend for point-cloud-directory inputs.")
@@ -151,6 +162,7 @@ def main():
         output_path=args.output_trajectory,
         fps=args.fps,
         init_yaw_samples=args.init_yaw_samples,
+        mesh_samples=args.mesh_samples,
     )
 
 

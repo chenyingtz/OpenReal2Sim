@@ -89,6 +89,39 @@ def discover_frames(point_cloud_dir: Path) -> List[Path]:
     return sorted(set(paths), key=lambda p: (len(p.stem), p.stem))
 
 
+# ───────────────────────── Mesh kd-tree ─────────────────────────
+
+class MeshKDTree:
+    """Nearest-neighbor query against a uniformly surface-sampled mesh.
+
+    Why not `trimesh.proximity.ProximityQuery`: that constructs an rtree over
+    every triangle, which on hundreds-of-thousands-of-faces meshes (e.g.
+    photogrammetry / image-to-3D reconstructions) routinely allocates
+    gigabytes and triggers the Linux OOM killer. For ICP-style closest-mesh-
+    point queries, a kd-tree over a fixed surface-sample budget is equivalent
+    within a few millimeters and is memory-bounded regardless of mesh size.
+    """
+
+    def __init__(self, mesh: trimesh.Trimesh, n_samples: int = 8000, seed: int = 0):
+        from scipy.spatial import cKDTree
+        # Always surface-sample so the kd-tree is dense in 3D regardless of
+        # how the mesh was tessellated. Vertex-only fallback is reserved for
+        # the degenerate case of a face-less mesh (i.e. a point cloud).
+        if len(mesh.faces) > 0:
+            np.random.seed(seed)
+            samples, _ = trimesh.sample.sample_surface(mesh, n_samples)
+            pts = np.asarray(samples, dtype=np.float64)
+        else:
+            pts = np.asarray(mesh.vertices, dtype=np.float64)
+        self.points = pts
+        self.tree = cKDTree(pts)
+
+    def closest_points(self, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (closest_mesh_points, distances) for each query point."""
+        dists, idx = self.tree.query(queries, k=1)
+        return self.points[idx], dists
+
+
 # ───────────────────────── Rigid alignment ─────────────────────────
 
 def kabsch(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -120,16 +153,20 @@ def point_to_mesh_icp(
     tol: float = 1e-7,
     outlier_quantile: float = 0.85,
     max_points: int = 4000,
-    proximity: Optional[trimesh.proximity.ProximityQuery] = None,
+    mesh_kdtree: Optional[MeshKDTree] = None,
+    mesh_samples: int = 8000,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Align `mesh` to the observed `points` via point-to-surface ICP.
+    """Align `mesh` to the observed `points` via point-to-point ICP.
 
     Each iteration:
       1. Map `points` into mesh-local frame: p_local = (points - t) @ R
          (since the forward transform is world = R @ mesh_local + t).
-      2. Query each p_local for its closest surface point on the mesh.
+      2. Query each p_local for its closest mesh surface sample (kd-tree).
       3. Drop the worst `1 - outlier_quantile` of correspondences by distance.
       4. Solve `kabsch(closest_pts, points)` on the inlier set.
+
+    The mesh kd-tree is built once and can be passed in via `mesh_kdtree` so
+    the multi-start search at frame 0 doesn't repeat the construction cost.
 
     Returns `(R, t, mean_inlier_residual_in_meters)`.
     """
@@ -141,12 +178,12 @@ def point_to_mesh_icp(
         rng = np.random.default_rng(0)
         points = points[rng.choice(len(points), max_points, replace=False)]
 
-    pq = proximity if proximity is not None else trimesh.proximity.ProximityQuery(mesh)
+    kd = mesh_kdtree if mesh_kdtree is not None else MeshKDTree(mesh, n_samples=mesh_samples)
 
     prev_err = np.inf
     for _ in range(max_iter):
         p_local = (points - t) @ R
-        closest_pts, dists, _ = pq.on_surface(p_local)
+        closest_pts, dists = kd.closest_points(p_local)
         thresh = float(np.quantile(dists, outlier_quantile))
         inliers = dists < thresh
         if int(inliers.sum()) < 10:
@@ -166,6 +203,8 @@ def _initial_pose_search(
     mesh: trimesh.Trimesh,
     points: np.ndarray,
     n_yaw_samples: int = 8,
+    mesh_kdtree: Optional[MeshKDTree] = None,
+    mesh_samples: int = 8000,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Multi-start ICP for frame 0.
 
@@ -173,7 +212,7 @@ def _initial_pose_search(
     from Step 5), each with translation initialized to align centroids.
     Returns the (R, t, residual) of the seed with the lowest final residual.
     """
-    pq = trimesh.proximity.ProximityQuery(mesh)
+    kd = mesh_kdtree if mesh_kdtree is not None else MeshKDTree(mesh, n_samples=mesh_samples)
     point_centroid = points.mean(axis=0)
     mesh_centroid = np.asarray(mesh.centroid, dtype=np.float64)
 
@@ -184,7 +223,7 @@ def _initial_pose_search(
                            [s,  c, 0.0],
                            [0.0, 0.0, 1.0]], dtype=np.float64)
         t_init = point_centroid - R_init @ mesh_centroid
-        R, t, err = point_to_mesh_icp(mesh, points, R0=R_init, t0=t_init, proximity=pq)
+        R, t, err = point_to_mesh_icp(mesh, points, R0=R_init, t0=t_init, mesh_kdtree=kd)
         if err < best[2]:
             best = (R, t, err)
     return best
