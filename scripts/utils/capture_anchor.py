@@ -1,30 +1,39 @@
 #!/usr/bin/env python3
-"""Step 2.1 — Capture the Physical Anchor (RGB + metric depth).
+"""Step 2.1 — Capture the Physical Anchor.
 
-Captures a synchronized RGB / depth pair from an Intel RealSense camera
-(D415 / D435 / D455 / L515) and writes the two files Step 2 of the PDF
-expects:
+Two input paths are supported, picked at runtime:
 
-    <output_dir>/input_anchor.png    8-bit BGR PNG (the RGB anchor I_0)
-    <output_dir>/input_depth.png     16-bit PNG, units = millimeters (D_0)
+A) RealSense capture (default).
+   Captures a synchronized RGB / depth pair from an Intel RealSense camera
+   (D415 / D435 / D455 / L515) and writes both files Step 2 of the PDF
+   expects:
+       <output_dir>/input_anchor.png    8-bit BGR PNG (the RGB anchor I_0)
+       <output_dir>/input_depth.png     16-bit PNG, mm units            (D_0)
+   The depth stream is aligned to the color stream so the two PNGs are
+   pixel-aligned. A short warm-up burst lets auto-exposure stabilize.
 
-The depth stream is aligned to the color stream so the two PNGs are pixel-
-aligned. A short warm-up burst lets auto-exposure stabilize before the
-saved frame is grabbed.
+       python scripts/utils/capture_anchor.py --output_dir data/lego_dog_walk/
 
-Usage:
-    python scripts/utils/capture_anchor.py --output_dir data/lego_dog_walk/
+B) Pre-existing RGB photo (no depth sensor).
+   Pass `--rgb_source path/to/your_photo.{jpg,png,...}` and the script
+   normalizes that file (strips alpha, drops to 8-bit, re-encodes as PNG)
+   and writes it to <output_dir>/input_anchor.png. No depth file is
+   produced; Step 3.2 has a calibration-free fallback for this case (see
+   `scripts/reconstruction/calibrate_metric_scale.py`).
+
+       python scripts/utils/capture_anchor.py \\
+           --rgb_source path/to/lego_dog.jpg \\
+           --output_dir data/lego_dog_walk/
 
 Requirements:
-    pip install pyrealsense2 opencv-python numpy
+    pip install opencv-python numpy             # both modes
+    pip install pyrealsense2                    # only for RealSense mode
 
-For non-RealSense hardware:
+For non-RealSense depth hardware:
 - iPhone Pro / iPad Pro with LiDAR: use Record3D, export the depth-aligned
   PNG, then rename to input_depth.png.
 - Azure Kinect: use the Azure Kinect SDK's k4aviewer to capture, then
   convert the depth .mkv / .raw to a 16-bit PNG in millimeters.
-- Any RGB-only camera: skip this step. Step 3.2 supports a calibration-free
-  path (just trust UniDepth's metric output); see calibrate_metric_scale.py.
 """
 from __future__ import annotations
 
@@ -45,9 +54,89 @@ def _import_realsense():
         raise RuntimeError(
             "pyrealsense2 not installed. Install with:\n"
             "    pip install pyrealsense2\n"
-            "If you don't have a RealSense camera, see the script docstring "
-            "for alternatives (iPhone LiDAR, Azure Kinect, RGB-only)."
+            "If you don't have a RealSense camera, pass --rgb_source "
+            "path/to/your_photo.jpg to import an existing RGB image instead, "
+            "or see the script docstring for other depth-sensor options."
         ) from e
+
+
+def import_rgb_anchor(
+    rgb_source: str | Path,
+    output_dir: str | Path,
+    max_long_edge: int | None = None,
+) -> dict:
+    """Normalize an existing RGB photo into <output_dir>/input_anchor.png.
+
+    Useful when you have a phone / DSLR photo of the LEGO dog but no depth
+    sensor — the file becomes the I_0 anchor that Step 2.2 (video diffusion)
+    and Step 4 (segmentation / inpainting) ingest. No input_depth.png is
+    written; Step 3.2's calibration-free path handles that case.
+    """
+    src = Path(rgb_source)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not src.exists():
+        raise FileNotFoundError(f"--rgb_source not found: {src}")
+
+    img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(
+            f"OpenCV could not decode {src}. Supported formats include "
+            f"PNG, JPG, BMP, TIFF, WEBP."
+        )
+
+    src_shape = list(img.shape)
+
+    # Strip alpha channel if present.
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    elif img.ndim == 2:
+        # Single-channel grayscale -> replicate to 3 channels so downstream
+        # tooling (Veo, UniDepth, ObjectClear) sees a BGR image.
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    # Down-cast >8-bit photos (some smartphones export 16-bit HEIC->PNG).
+    if img.dtype != np.uint8:
+        max_val = float(img.max()) if img.size else 0.0
+        scale = 255.0 / max_val if max_val > 0 else 1.0
+        img = np.clip(img.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+
+    if max_long_edge is not None:
+        h, w = img.shape[:2]
+        long_edge = max(h, w)
+        if long_edge > max_long_edge:
+            new_w = int(round(w * max_long_edge / long_edge))
+            new_h = int(round(h * max_long_edge / long_edge))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    anchor_path = output_dir / "input_anchor.png"
+    if not cv2.imwrite(str(anchor_path), img):
+        raise RuntimeError(f"Failed to write {anchor_path}")
+
+    meta = {
+        "mode": "rgb_only",
+        "anchor_image": str(anchor_path),
+        "depth_image": None,
+        "source_path": str(src),
+        "source_shape": src_shape,
+        "saved_shape": [int(img.shape[0]), int(img.shape[1]), int(img.shape[2])],
+        "max_long_edge": max_long_edge,
+        "depth_image_note": (
+            "No depth sensor; Step 3.2 should be run with the "
+            "calibration-free path (trust UniDepth's metric output)."
+        ),
+        "captured_at_unix": time.time(),
+    }
+    with open(output_dir / "_anchor_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[anchor] mode  : rgb_only")
+    print(f"[anchor] source: {src}  ({src_shape[1]}x{src_shape[0]})")
+    print(f"[anchor] color : {anchor_path}  "
+          f"({img.shape[1]}x{img.shape[0]}, 8-bit BGR PNG)")
+    print(f"[anchor] depth : not written (no sensor). Step 3.2 will run "
+          f"without --real_depth; see calibrate_metric_scale.py.")
+    return meta
 
 
 def capture(
@@ -142,10 +231,16 @@ def capture(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Step 2.1 — RealSense RGB+depth anchor capture")
+    ap = argparse.ArgumentParser(description="Step 2.1 — Physical anchor capture")
     ap.add_argument("--output_dir", required=True,
-                    help="Where to write input_anchor.png and input_depth.png "
-                         "(typically data/lego_dog_walk/)")
+                    help="Where to write input_anchor.png (and input_depth.png in "
+                         "RealSense mode). Typically data/lego_dog_walk/.")
+    ap.add_argument("--rgb_source", default=None,
+                    help="Path to an existing RGB photo to import as input_anchor.png. "
+                         "When provided, RealSense capture is skipped (rgb-only mode).")
+    ap.add_argument("--max_long_edge", type=int, default=None,
+                    help="(rgb-only mode) Resize so the longer edge is at most this "
+                         "many pixels (default: keep native resolution).")
     ap.add_argument("--color_width", type=int, default=1280)
     ap.add_argument("--color_height", type=int, default=720)
     ap.add_argument("--depth_width", type=int, default=640)
@@ -153,11 +248,18 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--warmup_frames", type=int, default=30,
                     help="Frames to discard before grabbing the keeper (lets "
-                         "auto-exposure settle)")
+                         "auto-exposure settle).")
     ap.add_argument("--no_align", action="store_true",
-                    help="Skip depth-to-color alignment (advanced; the saved "
-                         "depth PNG will not be pixel-registered to the RGB)")
+                    help="(RealSense mode) Skip depth-to-color alignment.")
     args = ap.parse_args()
+
+    if args.rgb_source is not None:
+        import_rgb_anchor(
+            rgb_source=args.rgb_source,
+            output_dir=args.output_dir,
+            max_long_edge=args.max_long_edge,
+        )
+        return
 
     capture(
         output_dir=args.output_dir,
