@@ -246,8 +246,20 @@ def main():
 
     log_dir = Path(cfg.output["log_dir"])
     ckpt_path = Path(args.checkpoint) if args.checkpoint else (log_dir / "policy_final.pt")
-    out_dir = Path(args.out_dir) if args.out_dir else (log_dir / "visualization")
+    # Default output goes to a sibling `results/<method_name>/` tree so
+    # training artifacts under runs/ stay clean and successive viz runs for
+    # different methods don't share a folder. The method name is derived
+    # from the checkpoint's parent directory (e.g. runs/lego_dog_residual_bc
+    # → results/visualization/lego_dog_residual_bc/) so residual / direct /
+    # BC checkpoints route to distinct output dirs even though they share
+    # the same config. Override via --out_dir.
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    else:
+        method_name = ckpt_path.parent.name or log_dir.name
+        out_dir = Path("results") / "visualization" / method_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[viz] output -> {out_dir}")
 
     # Read the action_mode from the checkpoint so residual / direct PPO / BC
     # checkpoints all visualize correctly with the env that matches their
