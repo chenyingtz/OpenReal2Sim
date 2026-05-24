@@ -68,6 +68,7 @@ def propagate(
     min_pixels: int = 100,
     open_iter: int = 1,
     close_iter: int = 2,
+    invert_seed_mask: bool = False,
 ) -> dict:
     seed_mask_path = Path(seed_mask_path)
     depth_dir = Path(depth_dir)
@@ -82,13 +83,34 @@ def propagate(
     with np.load(seed_depth_path) as z:
         seed_depth = np.asarray(z["depth"], dtype=np.float32)
     seed_mask = _load_mask(seed_mask_path, seed_depth.shape)
+    if invert_seed_mask:
+        seed_mask = ~seed_mask
+        print("[propagate] --invert_seed_mask: flipped seed mask polarity")
+
+    seed_coverage = float(seed_mask.mean())
+    print(f"[propagate] seed mask coverage: {seed_coverage*100:.1f}% of image")
+    # A typical foreground mask covers <30% of the frame. Above ~40% it is
+    # almost certainly the background mask (the user's robot_mask.png had
+    # white = floor / wall). Warn loudly so the user re-runs with
+    # --invert_seed_mask instead of debugging the propagated masks.
+    if seed_coverage > 0.4 and not invert_seed_mask:
+        print(f"[propagate] WARNING: the seed mask covers {seed_coverage*100:.1f}% "
+              f"of the image — this is unusual for a foreground (dog) mask and "
+              f"strongly suggests the polarity is inverted (white = background). "
+              f"If the propagated frames look inverted, re-run with "
+              f"--invert_seed_mask.")
+    elif seed_coverage < 0.005:
+        print(f"[propagate] WARNING: the seed mask covers only "
+              f"{seed_coverage*100:.2f}% of the image — too small to compute a "
+              f"reliable depth band. Use a more generous seed mask.")
 
     valid = (seed_depth > 0) & seed_mask
     if int(valid.sum()) == 0:
         raise ValueError(
             f"Seed mask + seed depth ({seed_depth_path.name}) overlap is empty. "
             "Either the mask is the wrong frame or the mask polarity is "
-            "inverted (white must mark the dog; my loader uses pixel > 127)."
+            "inverted (white must mark the dog; my loader uses pixel > 127). "
+            "Try re-running with --invert_seed_mask."
         )
     d_values = seed_depth[valid]
     d_min = float(np.percentile(d_values, 2))   # robust min, ignores depth-edge bleed
@@ -178,6 +200,10 @@ def main():
                     help="Binary-opening iterations (removes salt noise)")
     ap.add_argument("--close_iter", type=int, default=2,
                     help="Binary-closing iterations (fills small holes)")
+    ap.add_argument("--invert_seed_mask", action="store_true",
+                    help="Flip the seed mask before computing the depth band. "
+                         "Use when your seed mask has white=background, "
+                         "black=dog (the opposite of the script's convention).")
     args = ap.parse_args()
 
     propagate(
@@ -189,6 +215,7 @@ def main():
         min_pixels=args.min_pixels,
         open_iter=args.open_iter,
         close_iter=args.close_iter,
+        invert_seed_mask=args.invert_seed_mask,
     )
 
 
